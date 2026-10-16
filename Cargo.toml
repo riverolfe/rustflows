@@ -1,0 +1,22 @@
+[package]
+name = "rustflows"
+version = "0.1.0"
+edition = "2024"
+description = "Agent orchestration in Rust: a subprocess gate, a disk cache, and a token ceiling"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "time", "io-std", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+jsonschema = "0"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+
+[[bin]]
+name = "rustflows"
+path = "src/bin/rustflows.rs"
+
+[[bin]]
+name = "confine"
+path = "src/bin/confine.rs"
