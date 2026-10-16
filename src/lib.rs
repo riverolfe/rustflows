@@ -402,6 +402,99 @@ Return corrected JSON matching this schema exactly, by calling the StructuredOut
     Ok(Some(out))
 }
 
+/// The seam a workflow calls instead of [`ask`] directly.
+///
+/// pyflows' test suites monkeypatched their module's `ask` with a fake that
+/// dispatched on the prompt text. Without that, the invariants that matter most
+/// here are untestable: *a dead judge eliminates nobody*, *a dead verifier
+/// leaves its claims unconfirmed rather than refuted*, *a budget cut audits only
+/// what fits*. None of that is visible in a prompt string.
+///
+/// Per-run rather than a global override, so one test cannot leak into another.
+pub type AskFn = std::sync::Arc<
+    dyn Fn(String, Value, AskOpts)
+        -> futures::future::BoxFuture<'static, Result<Option<Value>, OrchError>>
+        + Send
+        + Sync,
+>;
+
+/// The real thing, wrapped for [`AskFn`]. What every caller passes in production.
+pub fn real_ask() -> AskFn {
+    std::sync::Arc::new(|p, s, o| Box::pin(async move { ask(&p, &s, o).await }))
+}
+
+/// Whether a URL is safe to hand an agent that will fetch it.
+///
+/// A searcher's output is model text from web pages. Without a check, a single
+/// returned `http://169.254.169.254/latest/meta-data/` becomes a fetch against
+/// the host's metadata service by an agent holding the repo — and `file://` or a
+/// bare path would not even need a server.
+///
+/// ponytail: string-level only. A public hostname that resolves to a private
+/// address passes, and a redirect to one is not re-checked, because the agent
+/// does the fetching and we never see the resolved address. Pin the egress
+/// instead if that matters: give the call a proxy that only reaches the internet.
+pub fn safe_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip the port, but only when it really is one.
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty())
+        .map_or(authority, |(h, _)| h)
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && blocked_ip(ip)
+    {
+        return false;
+    }
+    true
+}
+
+/// An address that reaches this host, this network, or nowhere.
+fn blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            // `::ffff:a.b.c.d` is an IPv4 address wearing a hat, and
+            // `is_loopback()` does not see through it — so unwrap first, or
+            // `::ffff:127.0.0.1` walks straight into the V6 rules and out.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return blocked_ip(std::net::IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local, fe80::/10 link-local
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 /// Turn a CLI budget stop into a budget error instead of a dead stage.
 ///
 /// The CLI checks the ceiling between turns, so it can overshoot by the cost of
@@ -586,5 +679,43 @@ mod tests {
     fn env_path_expands_a_leading_tilde() {
         // Path::new("~/.cache/x") is relative; the default must not be.
         assert!(env_path("RUSTFLOWS_DO_NOT_EXIST_XYZ", "~/.cache/rustflows-t").is_absolute());
+    }
+
+    #[test]
+    fn a_url_an_agent_would_fetch_must_not_reach_the_host() {
+        for ok in [
+            "https://example.com",
+            "http://example.com/page?q=1",
+            "https://example.com:8443/x",
+            "https://sub.domain.example.org/",
+        ] {
+            assert!(safe_url(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            "",
+            "not a url",
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "http://",
+            "http://localhost",
+            "http://localhost:8080/x",
+            "http://sub.localhost",
+            "http://db.internal/",
+            "http://redis.local/",
+            // The cloud metadata service, on every host.
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9000/",
+            "http://10.0.0.5/admin",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://0.0.0.0/",
+            "http://[::1]/",
+            "http://[fe80::1]/",
+            "http://[fc00::1]/",
+            // IPv6-mapped loopback.
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            assert!(!safe_url(bad), "{bad} must not be fetched");
+        }
     }
 }

@@ -317,6 +317,16 @@ impl Spend {
         *remaining -= 1;
         Ok(())
     }
+
+    /// What is left, without spending any.
+    ///
+    /// `upgrade` sizes its fan-out against this — the call count is not known
+    /// until the inventory returns — and `decide` refuses a field it cannot
+    /// afford before spending anything on it. Reading the mutex directly from a
+    /// workflow would make the field public API; this keeps it private.
+    pub fn remaining(&self) -> usize {
+        *self.remaining.lock().expect("spend mutex poisoned")
+    }
 }
 
 pub fn is_regular_file(path: &Path) -> bool {

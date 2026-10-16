@@ -4,8 +4,8 @@ Agent orchestration in Rust. Part of a program is ordinary code; some
 expressions are agent calls. The code decides what to call, in what order, and
 when to stop. The agent decides the answer.
 
-A port of [pyflows](../pyflows): the framework (`orch.py` + `panel.py`) plus the
-`review` workflow. `research`, `upgrade` and `decide` are not ported.
+A port of [pyflows](../pyflows): the framework (`orch.py` + `panel.py`) plus all
+four workflows — `review`, `research`, `upgrade` and `decide`.
 
 ## How it talks to Claude
 
@@ -41,6 +41,17 @@ rustflows review src --lenses 2   # middle ground
 rustflows review src --lens performance --lens error-handling
 rustflows review src --lens test-quality   # opt-in lens
 
+rustflows research "does X do Y"    # multi-modal sweep → synthesize → verify
+rustflows research "q" --angles 2 --depth 1   # fewer angles, more citations checked
+rustflows research "q" --no-verify  # skip citation checking
+
+rustflows upgrade .                # what would upgrading this repo's deps break?
+rustflows upgrade . --limit 2      # audit the 2 highest-blast-radius dependencies
+rustflows upgrade . --depth 5      # verify 5 candidate breaks instead of 3
+
+rustflows decide "which queue?" redis rabbitmq kafka   # pick by tournament
+rustflows decide "q" "a" "b" --max 4   # enter only the first 4 options
+
 rustflows agents                  # browse agents from past runs
 rustflows agents --json           # the raw run-log records
 rustflows watch                   # live view as agents report in
@@ -69,6 +80,34 @@ let found = gather(lenses.iter().map(|lens| ask(&prompt, &FINDINGS, AskOpts {
 - **`clean`** — strips terminal control characters and bidi overrides from model
   output before it reaches your terminal.
 - **`stat_signature`** — tree fingerprint for the cache key.
+- **`AskFn`** — the call seam the workflows use instead of `ask` directly, so
+  the orchestration invariants are testable without spawning an agent.
+
+## The four workflows
+
+| | shape | what makes it the interesting one |
+|---|---|---|
+| `review` | find → barrier → dedup → verify | fixed fan-out over a lens tuple |
+| `research` | sweep → synthesize → verify | four *modality* angles, blind to each other; the synthesizer reports contradictions rather than resolving them |
+| `upgrade` | inventory → sweep → verify | fan-out width is **discovered at runtime** — the inventory decides how many agents run |
+| `decide` | advocate → bracket → winner | a knockout bracket, not a pipeline: each verdict decides who plays next |
+
+`decide` is also the cheapest: no agent reads a repo, so nothing in its cache key
+depends on one and it costs nothing to re-run.
+
+### Exit codes
+
+Uniform across all four:
+
+| | |
+|---|---|
+| **0** | clean |
+| **1** | ran partially or not at all — something was unchecked, unconfirmed, dead, or cut short |
+| **2** | configuration error: unknown lens, `--angles 0`, no manifest, fewer than two options |
+
+The honesty rule: `safe to bump`, `All N checked citations held up` and
+`best option:` print **only** when nothing is unchecked, unconfirmed, dead or
+skipped. A partial run says what it could not check instead.
 
 A subprocess gate caps concurrency at 8. `MAX_CALLS` (40) bounds fan-out per
 run. `max_budget_usd` caps one call; the CLI checks it between turns and can
@@ -104,6 +143,28 @@ The run log is deliberately **not** inside the cache dir: `rm -rf
 cost.
 
 ## Deliberate differences from pyflows
+
+- **Every "how many" flag rejects 0 as a usage error (exit 2)** —
+  `--lenses`, `--angles`, `--limit`, `--depth`, `--max`. pyflows relies on
+  Python truthiness, so `--angles 0` silently means *all four angles* and
+  `--limit 0` silently means *no limit*: the user asks for one thing and gets
+  another. `--no-verify` already covers "verify nothing".
+- **`--max` is `Option<i64>` and rejects anything under 2.** `usize` cannot hold
+  the `-1` argparse accepts, which would then slice an option off the end.
+- **Config errors exit 2, not 1.** A missing manifest is a configuration error,
+  so it joins `unknown lens` rather than the run-failed code.
+- **Presentation order seeds from SHA-256, not CRC-32.** The property that
+  matters is only "stable, and derived from the option's own text so it is not
+  the argument order". `sha2` is already a dependency; `crc32fast` would not be.
+  The two projects have separate caches, so parity buys nothing.
+- **`render` returns a `String`** rather than printing, so the ~15 assertions on
+  CLI wording (`"safe to bump"`, `"NOT checked"`, `"fit the budget"`) are unit
+  tests. `review.rs` still prints inline.
+- **A judge verdict whose `winner` is unreadable counts as a dead verdict**, not
+  as index 0. pyflows would raise `IndexError`; the enum in `PAIR` plus `ask`'s
+  validation makes it unreachable, so the safe reading is the honest one.
+- **`decide` deduplicates its options before spending a call**, not in the CLI.
+  Same outcome, but it holds whatever the caller is.
 
 - **No named-skill support.** The CLI has no `--skills` flag, so a skill name is
   rejected with an error rather than silently ignored. Grant skills through a
