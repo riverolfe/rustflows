@@ -6,9 +6,12 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use rustflows::ext::Extensions;
 use rustflows::stats::{log_run, with_stats};
+use rustflows::workflows::decide;
+use rustflows::workflows::research;
 use rustflows::workflows::review::{
     ReviewArgs, ReviewError, check_target, choose_lenses, known_lens, print_confirmed, review,
 };
+use rustflows::workflows::upgrade;
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +39,49 @@ enum Command {
         /// Run this lens (repeatable); --lenses then caps the chosen list.
         #[arg(long = "lens")]
         lens: Vec<String>,
+        #[command(flatten)]
+        ext: ExtArgs,
+    },
+    /// Research a question, then check its citations.
+    Research {
+        question: String,
+        /// Limit search angles.
+        #[arg(long)]
+        angles: Option<usize>,
+        /// Citations to verify.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Skip citation checking.
+        #[arg(long = "no-verify")]
+        no_verify: bool,
+        #[command(flatten)]
+        ext: ExtArgs,
+    },
+    /// Audit dependency upgrades against a repo.
+    Upgrade {
+        #[arg(default_value = ".")]
+        target: PathBuf,
+        /// Max dependencies to audit.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Candidate breaks to verify.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Skip verification.
+        #[arg(long = "no-verify")]
+        no_verify: bool,
+        #[command(flatten)]
+        ext: ExtArgs,
+    },
+    /// Pick between options by knockout tournament.
+    Decide {
+        question: String,
+        /// Two or more options to choose between.
+        #[arg(required = true, num_args = 1..)]
+        options: Vec<String>,
+        /// Cap the field size.
+        #[arg(long)]
+        max: Option<i64>,
         #[command(flatten)]
         ext: ExtArgs,
     },
@@ -100,7 +146,34 @@ async fn main() -> std::process::ExitCode {
         Command::Review { target, quick, lenses, lens, ext } => {
             std::process::ExitCode::from(run_review(target, quick, lenses, lens, ext).await as u8)
         }
+        Command::Research { question, angles, depth, no_verify, ext } => std::process::ExitCode::from(
+            run_research(question, angles, depth, no_verify, ext).await as u8,
+        ),
+        Command::Upgrade { target, limit, depth, no_verify, ext } => {
+            std::process::ExitCode::from(run_upgrade(target, limit, depth, no_verify, ext).await as u8)
+        }
+        Command::Decide { question, options, max, ext } => {
+            std::process::ExitCode::from(run_decide(question, options, max, ext).await as u8)
+        }
     }
+}
+
+/// Shared preamble for the three non-review workflows.
+fn begin(target: &str, mode: &str, fanout: usize, unit: &str) {
+    rustflows::stats::with_stats(|s| s.reset());
+    rustflows::stats::log_run(serde_json::json!({
+        "outcome": "run_start",
+        "target": target,
+        "lenses": fanout,
+        "mode": mode,
+    }));
+    println!("{mode}: {fanout} {unit}");
+}
+
+/// The trailing summary every workflow prints.
+fn tail(started: Instant) {
+    println!("{}", rustflows::stats::with_stats(|s| s.summary()));
+    println!("wall clock: {:.0}s", started.elapsed().as_secs_f64());
 }
 
 async fn run_review(
@@ -196,4 +269,174 @@ fn lens_names() -> String {
     let mut names: Vec<&str> = rustflows::workflows::review::LENSES.to_vec();
     names.extend_from_slice(rustflows::workflows::review::OPT_IN_LENSES);
     format!("known lenses: {}", names.join(", "))
+}
+
+async fn run_research(
+    question: String,
+    angles: Option<usize>,
+    depth: usize,
+    no_verify: bool,
+    ext: ExtArgs,
+) -> i32 {
+    // A "how many" flag of 0 is a configuration error, not a request for zero
+    // work: pyflows reads it as falsy and quietly runs all four angles.
+    if angles == Some(0) || depth == 0 {
+        println!("--angles and --depth must be at least 1 (--no-verify skips checking entirely)");
+        return 2;
+    }
+    let ext = ext.into_extensions();
+    if let Err(e) = ext.check() {
+        println!("{e}");
+        return 2;
+    }
+    let started = Instant::now();
+    let n = angles.unwrap_or(rustflows::workflows::research::ANGLE_NAMES.len()).min(
+        rustflows::workflows::research::ANGLE_NAMES.len(),
+    );
+    begin(&question, "research", n, if n == 1 { "angle" } else { "angles" });
+
+    let result = research::research(research::ResearchArgs {
+        question,
+        angles,
+        depth,
+        verify: !no_verify,
+        spend: None,
+        ext,
+        asker: rustflows::real_ask(),
+    })
+    .await;
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            println!("research did not complete: {e}\n{}", rustflows::stats::with_stats(|s| s.summary()));
+            return 1;
+        }
+    };
+
+    print!("{}", research::render(&result));
+    tail(started);
+    research::exit_code(&result)
+}
+
+async fn run_upgrade(
+    target: PathBuf,
+    limit: Option<usize>,
+    depth: usize,
+    no_verify: bool,
+    ext: ExtArgs,
+) -> i32 {
+    if limit == Some(0) || depth == 0 {
+        println!("--limit and --depth must be at least 1 (--no-verify skips verification entirely)");
+        return 2;
+    }
+    // Both checked before a single agent call: a wrong target should not cost money.
+    if let Err(e) = check_target(&target) {
+        println!("{e}");
+        return 2;
+    }
+    let Some(manifest) = upgrade::find_manifest(&target) else {
+        println!(
+            "no manifest found (looked for {})",
+            upgrade::MANIFESTS.join(", ")
+        );
+        return 2;
+    };
+    let ext = ext.into_extensions();
+    if let Err(e) = ext.check() {
+        println!("{e}");
+        return 2;
+    }
+    let started = Instant::now();
+    begin(
+        &format!("{} ({manifest})", target.display()),
+        "upgrade",
+        0,
+        "dependencies (count discovered at runtime)",
+    );
+
+    let result = upgrade::upgrade(upgrade::UpgradeArgs {
+        target,
+        limit,
+        depth,
+        verify: !no_verify,
+        spend: None,
+        ext,
+        asker: rustflows::real_ask(),
+    })
+    .await;
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            println!("upgrade did not complete: {e}\n{}", rustflows::stats::with_stats(|s| s.summary()));
+            return 1;
+        }
+    };
+
+    print!("{}", upgrade::render(&result));
+    tail(started);
+    upgrade::exit_code(&result)
+}
+
+async fn run_decide(
+    question: String,
+    options: Vec<String>,
+    max: Option<i64>,
+    ext: ExtArgs,
+) -> i32 {
+    // `is not None`, not truthiness: `--max 0` is a request for an empty field,
+    // and a negative one slices the option off the end. Both are user error.
+    if let Some(m) = max
+        && m < 2
+    {
+        println!("--max {m} leaves no tournament; it needs at least 2");
+        return 2;
+    }
+    let field = decide::choose_options(&options);
+    if field.len() < 2 {
+        println!("need at least two distinct options");
+        return 2;
+    }
+    let field: Vec<String> = match max {
+        // A cap above the field size must not claim a truncation it did not do.
+        Some(m) if (m as usize) < field.len() => {
+            println!("capped from {} to {m}", field.len());
+            field[..m as usize].to_vec()
+        }
+        _ => field,
+    };
+    let ext = ext.into_extensions();
+    if let Err(e) = ext.check() {
+        println!("{e}");
+        return 2;
+    }
+    let started = Instant::now();
+
+    // An advocate plus its judges is about two calls per option.
+    let spend = std::sync::Arc::new(rustflows::stats::Spend::new(rustflows::MAX_CALLS));
+    let (field, capped) = decide::cap_to_budget(&field, spend.remaining());
+    if capped {
+        println!("only {}/{} options fit the budget", field.len(), field.len());
+    }
+    begin(&question, "decide", field.len(), if field.len() == 1 { "option" } else { "options" });
+
+    let result = decide::decide(decide::DecideArgs {
+        question,
+        options: field,
+        spend: Some(spend),
+        ext,
+        asker: rustflows::real_ask(),
+        capped,
+    })
+    .await;
+    let brief = match result {
+        Ok(b) => b,
+        Err(e) => {
+            println!("decision did not complete: {e}\n{}", rustflows::stats::with_stats(|s| s.summary()));
+            return 1;
+        }
+    };
+
+    print!("{}", decide::render(&brief));
+    tail(started);
+    decide::exit_code(&brief)
 }
