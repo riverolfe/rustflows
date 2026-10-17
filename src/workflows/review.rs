@@ -220,6 +220,11 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
             "no lenses selected — name at least one with --lens".into(),
         ));
     }
+    // The CLI checks this too, but `ReviewArgs` is public API and a plain file
+    // here is used as the agents' cwd and as the confinement root.
+    if let Err(e) = check_target(&target) {
+        return Err(ReviewError::Failed(e));
+    }
     let target_arg = target.display().to_string();
     // `chunks(0)` panics. The CLI cannot pass 0, but `ReviewArgs` is public API.
     let batch_size = batch_size.unwrap_or_else(batch_size_default).max(1);
@@ -324,7 +329,12 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let label = format!("verify/{first_file}:{}", batch.len());
+                // The panel's stage column is 32 wide, and every sibling workflow bounds its
+                // labels. This one interpolates a full agent-supplied path.
+                let label = format!("verify/{first_file}:{}", batch.len())
+                    .chars()
+                    .take(32)
+                    .collect::<String>();
                 let cwd = target.clone();
                 let dep = Some(target.clone());
                 let ext = ext.clone();
