@@ -4,8 +4,9 @@ Agent orchestration in Rust. Part of a program is ordinary code; some
 expressions are agent calls. The code decides what to call, in what order, and
 when to stop. The agent decides the answer.
 
-A port of [pyflows](../pyflows): the framework (`orch.py` + `panel.py`) plus all
-four workflows — `review`, `research`, `upgrade` and `decide`.
+A port of `pyflows`, a Python sibling project: the framework (`orch.py` +
+`panel.py`) plus all four workflows — `review`, `research`, `upgrade` and
+`decide`. Where this deliberately differs, it says so below.
 
 ## How it talks to Claude
 
@@ -124,6 +125,20 @@ Paths are checked under **both** orderings of symlink resolution and `..`
 elimination, because the CLI applies `..` lexically while `canonicalize` follows
 links first — checking only one lets the other through.
 
+The boundary **fails closed**. A `tool_input` that is missing, unparseable, or
+carries no `tool_name` is refused outright. So is a path field that is present
+but is not a string — a value the hook cannot interpret is a read it cannot
+confine, and approving it would make the boundary the weakest part of it.
+
+Two things are deliberately *not* refused, because they are the tool's own
+documented defaults rather than something unchecked: an omitted `path` on `Grep`
+or `Glob` (both search `cwd`, which is the root), and an empty string standing
+in for `cwd` — which is resolved and checked rather than skipped past.
+
+`~` is expanded, including a bare `~`, because the CLI expands it: without that,
+`Grep {"path": "~"}` resolved to `<root>/~` — inside the root, therefore
+allowed — while the agent read the user's whole home directory.
+
 Web tools are not confined: an agent with `WebFetch` can still send what it read
 under `cwd` to a URL.
 
@@ -174,5 +189,9 @@ cost.
 - **Confinement is part of the cache key.** An entry produced while the hook was
   missing must not be served to a confined run — otherwise a leak gets cached and
   replayed on the next run. This actually happened during the port.
-- **Confinement is skipped silently if the hook binary is missing.** The settings
-  document is simply not sent. Loud failure would be better; add it if it bites.
+- **Confinement is skipped silently if the hook binary is missing or not
+  executable.** The settings document is simply not sent. Loud failure would be
+  better; add it if it bites. It has now bitten twice: a non-executable `confine`
+  was accepted as runnable, so reads went out unconfined while the cache key
+  still recorded `confined=true`. The executable bit is now required, and a
+  missing or non-executable hook is treated as absent.

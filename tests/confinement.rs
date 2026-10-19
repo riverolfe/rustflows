@@ -86,6 +86,88 @@ fn a_granted_root_is_readable_and_its_neighbour_is_not() {
     let _ = std::fs::remove_dir_all(&neighbour);
 }
 
+/// A path field the hook cannot read is refused, not waved through.
+///
+/// This is the one case where the boundary failed *open*: the field loop
+/// `continue`d on anything that was not a string, so `{"file_path": 123}`
+/// resolved to "no path to check" and was approved. Whether the CLI would have
+/// errored on that value is beside the point — a hook that cannot interpret a
+/// read must not approve it.
+#[test]
+fn a_path_field_the_hook_cannot_read_is_denied() {
+    let root = scratch("rf-hook-unreadable");
+
+    for bad in [json_cell(123), json_cell(true), json_cell(serde_json::json!(null))] {
+        let out = ask_the_hook(
+            std::slice::from_ref(&root),
+            serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": bad}}),
+        );
+        assert!(denied(&out), "an unreadable file_path was allowed: {out:?}");
+        // The reason must not claim it was outside the root, or the person
+        // debugging it goes looking in the wrong place.
+        let reason = out.pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        assert!(!reason.contains("outside the working directory"), "{reason}");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A bare `~` is `$HOME`, and reading it must be refused unless home is granted.
+///
+/// Only `~/x` used to be expanded, so `~` resolved to `<root>/~` — inside the
+/// root, therefore approved — while the CLI expanded it and read the whole home
+/// directory. The unit test covers the expansion; this one drives the real
+/// binary, because the boundary is only as good as the binary that enforces it.
+#[test]
+fn a_bare_tilde_reads_home_and_is_not_inside_the_working_directory() {
+    let root = scratch("rf-hook-tilde");
+    let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+    if home.starts_with(&root) {
+        return; // HOME under the root: nothing to distinguish.
+    }
+
+    let out = ask_the_hook(
+        std::slice::from_ref(&root),
+        serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": "~"}}),
+    );
+    assert!(denied(&out), "a bare ~ was treated as inside the root: {out:?}");
+
+    // Granted explicitly, the same call is legitimate.
+    let granted = ask_the_hook(
+        &[root.clone(), home],
+        serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": "~"}}),
+    );
+    assert!(!denied(&granted), "a granted home was refused: {granted:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The tool's own default is not an unchecked read: Grep and Glob without a
+/// `path` search the working directory, which is the root. Pinning this stops
+/// the fail-closed fix from breaking ordinary searches.
+#[test]
+fn an_omitted_path_field_is_the_tools_own_default() {
+    let root = scratch("rf-hook-default");
+    for (tool, input) in [
+        ("Grep", serde_json::json!({"pattern": "needle"})),
+        ("Glob", serde_json::json!({"pattern": "src/**/*.py"})),
+    ] {
+        let out = ask_the_hook(
+            std::slice::from_ref(&root),
+            serde_json::json!({"tool_name": tool, "tool_input": input}),
+        );
+        assert!(!denied(&out), "{tool} without a path was refused: {out:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `json!` needs a `Value`; `serde_json::to_value` for a literal like `123`.
+fn json_cell(v: impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(v).expect("a serialisable literal")
+}
+
 /// The CLI actually runs the hook, and the hook's deny holds.
 #[tokio::test]
 #[ignore = "spawns a real agent call"]
@@ -175,6 +257,13 @@ fn a_hook_binary_path_with_a_space_is_quoted() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("confine");
     std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+    // Runnable, not merely present: `confine_settings` requires the executable
+    // bit, so a plain file would now be treated as a missing hook.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     let settings = rustflows::runner::confine_settings(&bin, Path::new("/tmp"), &[])
         .expect("the binary exists, so settings should be built");

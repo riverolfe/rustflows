@@ -546,7 +546,7 @@ where
 pub fn confine_bin() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("RUSTFLOWS_CONFINE") {
         let p = PathBuf::from(p);
-        if stats::is_regular_file(&p) {
+        if stats::is_executable_file(&p) {
             return Some(p);
         }
     }
@@ -554,7 +554,7 @@ pub fn confine_bin() -> Option<PathBuf> {
     let dir = exe.parent()?;
     for name in ["confine", "confine.exe"] {
         let candidate = dir.join(name);
-        if stats::is_regular_file(&candidate) {
+        if stats::is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
