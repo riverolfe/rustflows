@@ -333,6 +333,31 @@ pub fn is_regular_file(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
 
+/// A regular file the OS will actually run.
+///
+/// Distinct from [`is_regular_file`] because "the file exists" and "the file is
+/// executable" are different facts, and the `confine` hook needs both: an
+/// executable check that only looks for a regular file accepts a hook that the
+/// CLI cannot exec, so no boundary runs — while the cache key still records
+/// `confined=true` and serves that unconfined answer to every later run.
+pub fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

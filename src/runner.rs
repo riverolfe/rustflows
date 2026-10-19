@@ -7,7 +7,6 @@
 //! terminal `result` is discarded.
 
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -253,17 +252,24 @@ pub fn confine_settings(
     root: &Path,
     also: &[PathBuf],
 ) -> Option<String> {
-    if !crate::stats::is_regular_file(confine_bin) {
+    if !crate::stats::is_executable_file(confine_bin) {
         return None;
     }
-    let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    roots.insert(root.display().to_string(), Vec::new());
-    for r in also {
-        roots.entry(r.display().to_string()).or_default();
-    }
-    let args: Vec<String> = roots
-        .keys()
-        .map(|r| shell_quote(r))
+    // The working directory first, always. This used to be a BTreeMap's keys(),
+    // which iterate in sorted order — so `~/.claude/skills` could become argv[1]
+    // and the hook, which takes its first root as the boundary, adopted a
+    // directory as the confinement root instead of the cwd.
+    let root_arg = root.display().to_string();
+    let mut others: Vec<String> = also
+        .iter()
+        .map(|r| r.display().to_string())
+        .filter(|r| *r != root_arg)
+        .collect();
+    others.sort();
+    others.dedup();
+    let args: Vec<String> = std::iter::once(root_arg)
+        .chain(others)
+        .map(|r| shell_quote(&r))
         .collect();
     // The binary path is quoted too: a path with a space would otherwise
     // word-split and the hook would never run — which reads as "nothing to
@@ -355,8 +361,7 @@ mod tests {
 
     #[test]
     fn confine_settings_quote_every_root() {
-        let bin = std::env::temp_dir().join("rustflows-confine-test");
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let bin = executable_temp_hook();
         let s = confine_settings(&bin, Path::new("/tmp/a b"), &[PathBuf::from("/tmp/c")]).unwrap();
         assert!(s.contains("Read|Grep|Glob"));
         assert!(s.contains("'/tmp/a b'"));
@@ -364,9 +369,59 @@ mod tests {
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// A file the OS will run, which is what `confine_settings` now requires.
+    fn executable_temp_hook() -> PathBuf {
+        let bin = std::env::temp_dir().join(format!("rustflows-confine-test-{}", std::process::id()));
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
     #[test]
-    fn confine_settings_are_omitted_when_the_hook_is_missing() {
+    fn the_working_directory_is_the_first_root_the_hook_receives() {
+        // This used to be a BTreeMap's keys(), which iterate sorted. An extra
+        // root sorting before the cwd — which is what a ~/.claude/skills grant
+        // does — put the hook's boundary on the wrong directory.
+        let bin = executable_temp_hook();
+        let s = confine_settings(
+            &bin,
+            Path::new("/repo"),
+            &[
+                PathBuf::from("/granted/skills"),
+                PathBuf::from("/extra"),
+            ],
+        )
+        .unwrap();
+        let argv = s.split("command").nth(1).expect("a command");
+        let cwd_at = argv.find("'/repo'").expect("the cwd is passed");
+        let skills_at = argv.find("skills").expect("the granted root is passed");
+        assert!(cwd_at < skills_at, "the cwd must come first: {argv}");
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    #[test]
+    fn confine_settings_are_omitted_when_the_hook_is_not_runnable() {
         assert!(confine_settings(Path::new("/nope/confine"), Path::new("/tmp"), &[]).is_none());
+
+        // Exists, is a regular file, and cannot be run. Approving the settings
+        // document here would leave reads unconfined while the cache key still
+        // recorded confined=true.
+        let bin = std::env::temp_dir().join(format!("rustflows-confine-noexec-{}", std::process::id()));
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(
+            confine_settings(&bin, Path::new("/tmp"), &[]).is_none(),
+            "a non-executable hook must be treated as missing"
+        );
+        let _ = std::fs::remove_file(&bin);
     }
 
     #[test]
