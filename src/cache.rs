@@ -112,11 +112,6 @@ pub fn default_cache() -> Cache {
     Cache::new(cache_dir())
 }
 
-/// True when `child` resolves inside `root` (or `root` itself).
-pub fn is_relative_to(child: &Path, root: &Path) -> bool {
-    child == root || child.starts_with(root)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,12 +137,5 @@ mod tests {
         assert!(cache.get("broken", "l").is_none());
         assert!(cache.get("absent", "l").is_none());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn relative_to_includes_self() {
-        assert!(is_relative_to(Path::new("/a/b"), Path::new("/a/b")));
-        assert!(is_relative_to(Path::new("/a/b/c"), Path::new("/a/b")));
-        assert!(!is_relative_to(Path::new("/a/bc"), Path::new("/a/b")));
     }
 }

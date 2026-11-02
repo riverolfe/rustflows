@@ -296,6 +296,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn spec() -> CallSpec {
         CallSpec { cwd: PathBuf::from("/tmp"), ..Default::default() }
@@ -361,7 +362,7 @@ mod tests {
 
     #[test]
     fn confine_settings_quote_every_root() {
-        let bin = executable_temp_hook();
+        let bin = temp_hook("quote", 0o755);
         let s = confine_settings(&bin, Path::new("/tmp/a b"), &[PathBuf::from("/tmp/c")]).unwrap();
         assert!(s.contains("Read|Grep|Glob"));
         assert!(s.contains("'/tmp/a b'"));
@@ -369,15 +370,37 @@ mod tests {
         let _ = std::fs::remove_file(&bin);
     }
 
-    /// A file the OS will run, which is what `confine_settings` now requires.
-    fn executable_temp_hook() -> PathBuf {
-        let bin = std::env::temp_dir().join(format!("rustflows-confine-test-{}", std::process::id()));
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+    /// A hook file in the temp dir, with the given mode.
+    ///
+    /// One path per test: two tests sharing a name deleted each other's hook
+    /// and the loser failed, which is how this became flaky.
+    ///
+    /// `create_new` rather than `write`, and a random component in the name:
+    /// the temp dir is world-writable on Linux, so a symlink pre-created at a
+    /// predictable path would otherwise be followed and overwritten.
+    fn temp_hook(tag: &str, mode: u32) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let bin = std::env::temp_dir().join(format!(
+            "rustflows-confine-test-{}-{nonce}-{tag}",
+            std::process::id()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap()
+            .write_all(b"#!/bin/sh\n")
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).unwrap();
         }
+        #[cfg(not(unix))]
+        let _ = mode;
         bin
     }
 
@@ -386,7 +409,7 @@ mod tests {
         // This used to be a BTreeMap's keys(), which iterate sorted. An extra
         // root sorting before the cwd — which is what a ~/.claude/skills grant
         // does — put the hook's boundary on the wrong directory.
-        let bin = executable_temp_hook();
+        let bin = temp_hook("order", 0o755);
         let s = confine_settings(
             &bin,
             Path::new("/repo"),
@@ -410,13 +433,7 @@ mod tests {
         // Exists, is a regular file, and cannot be run. Approving the settings
         // document here would leave reads unconfined while the cache key still
         // recorded confined=true.
-        let bin = std::env::temp_dir().join(format!("rustflows-confine-noexec-{}", std::process::id()));
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        let bin = temp_hook("noexec", 0o644);
         assert!(
             confine_settings(&bin, Path::new("/tmp"), &[]).is_none(),
             "a non-executable hook must be treated as missing"

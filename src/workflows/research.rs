@@ -131,6 +131,14 @@ pub struct ResearchResult {
     /// reported rather than dropped — the same rule `upgrade` applies to its
     /// `beyond --depth` findings.
     pub over_depth: usize,
+    /// The `--depth` the run was given. Reported so "beyond --depth 3" names
+    /// the limit, not the number of citations that missed it.
+    pub depth: usize,
+    /// Sources the brief listed that are not citations we can check: no usable
+    /// URL, or a repeat of one already listed. Reported, not dropped — a brief
+    /// that cited the metadata service must not report as if it never did.
+    /// Empty string where the source named no URL.
+    pub skipped: Vec<String>,
     pub elapsed: f64,
 }
 
@@ -220,14 +228,26 @@ fn verify_label(url: &str) -> String {
     format!("verify/{tail}")
 }
 
-/// The citations worth checking, deduplicated by URL.
+/// The citations worth checking, deduplicated by URL, and the sources that are
+/// not citations.
 ///
 /// Skips a source that is a bare string (the pre-fix shape), an empty claim, an
 /// empty URL, a URL that must not be fetched, and a claim that *is* its URL — a
 /// self-referential claim carries no assertion, so a verifier could only confirm
 /// the page exists.
-pub fn citations(brief: &Value) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+#[derive(Debug, Default)]
+pub struct Citations {
+    /// The claims and URLs to check, in the order the brief lists them.
+    pub checkable: Vec<(String, String)>,
+    /// Sources that are not citations we can check: no usable URL, or a repeat
+    /// of one already listed. Counted, not dropped — a brief that cited the
+    /// metadata service must not report as if it never did. Empty string where
+    /// the source named no URL.
+    pub skipped: Vec<String>,
+}
+
+pub fn citations(brief: &Value) -> Citations {
+    let mut out = Citations::default();
     let mut seen: HashSet<String> = HashSet::new();
     let Some(sources) = brief.get("sources").and_then(Value::as_array) else {
         return out;
@@ -238,14 +258,15 @@ pub fn citations(brief: &Value) -> Vec<(String, String)> {
         }
         let claim = str_field(source, "claim").trim().to_string();
         let url = str_field(source, "url").trim().to_string();
-        if claim.is_empty()
-            || claim == url
-            || !crate::safe_url(&url)
-            || !seen.insert(url.clone())
-        {
+        if claim.is_empty() || claim == url || !crate::safe_url(&url) {
+            out.skipped.push(url);
             continue;
         }
-        out.push((claim, url));
+        if !seen.insert(url.clone()) {
+            out.skipped.push(url);
+            continue;
+        }
+        out.checkable.push((claim, url));
     }
     out
 }
@@ -408,6 +429,7 @@ pub async fn research(args: ResearchArgs) -> Result<ResearchResult, ResearchErro
         gaps: strings(&brief, "gaps"),
         angles_alive: alive.len(),
         angles_dead: chosen - alive.len(),
+        depth,
         ..Default::default()
     };
     if !verify {
@@ -419,9 +441,10 @@ pub async fn research(args: ResearchArgs) -> Result<ResearchResult, ResearchErro
     // excludes is counted, not dropped: ten citations checked at depth 3 must
     // not report "all 3 held up" and exit 0 as if that were the whole brief.
     let all = citations(&brief);
-    let over_depth = all.len().saturating_sub(depth);
-    let targets: Vec<(String, String)> = all.into_iter().take(depth).collect();
+    let over_depth = all.checkable.len().saturating_sub(depth);
+    let targets: Vec<(String, String)> = all.checkable.into_iter().take(depth).collect();
     result.over_depth = over_depth;
+    result.skipped = all.skipped;
     if targets.is_empty() {
         result.nothing_checked = true;
         result.elapsed = started.elapsed().as_secs_f64();
@@ -487,7 +510,11 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
 /// a brief whose every citation was refuted is a complete answer.
 pub fn exit_code(r: &ResearchResult) -> i32 {
     i32::from(
-        !r.unchecked.is_empty() || r.angles_dead > 0 || r.nothing_checked || r.over_depth > 0,
+        !r.unchecked.is_empty()
+            || r.angles_dead > 0
+            || r.nothing_checked
+            || r.over_depth > 0
+            || !r.skipped.is_empty(),
     )
 }
 
@@ -525,8 +552,18 @@ pub fn render(r: &ResearchResult) -> String {
             "\n{}/{} citations were NOT checked — beyond --depth {}\n",
             r.over_depth,
             r.over_depth + r.verified.unwrap_or(0) + r.unsupported.len() + r.unchecked.len(),
-            r.over_depth,
+            r.depth,
         ));
+    }
+    if !r.skipped.is_empty() {
+        out.push_str(&format!(
+            "\n{} sources were not citations — no usable URL, or a repeat of one already \
+             listed:\n",
+            r.skipped.len()
+        ));
+        for u in r.skipped.iter().filter(|u| !u.is_empty()) {
+            out.push_str(&format!("  {u}\n"));
+        }
     }
     if r.angles_dead > 0 {
         out.push_str(&format!(
@@ -598,8 +635,8 @@ mod tests {
                 vec!["actually support"],
                 true,
                 vec![
-                    json!({"claim": "one", "url": "http://1"}),
-                    json!({"claim": "two", "url": "http://2"}),
+                    json!({"claim": "one", "url": "http://one.example"}),
+                    json!({"claim": "two", "url": "http://two.example"}),
                 ],
             )
         }
@@ -787,11 +824,15 @@ mod tests {
             "a bare string from the pre-fix shape",
         ]});
         assert_eq!(
-            citations(&brief),
+            citations(&brief).checkable,
             vec![("uv ships 3.14t builds".to_string(), "http://a".to_string())]
         );
-        assert!(citations(&json!({"sources": ["just a string"]})).is_empty());
-        assert!(citations(&json!({})).is_empty());
+        // Four sources named something that is not a citation: a claim that is
+        // the URL, no claim, no URL, and a repeat of the first. Counted, so
+        // the report can say the brief offered more than it checked.
+        assert_eq!(citations(&brief).skipped.len(), 4);
+        assert!(citations(&json!({"sources": ["just a string"]})).checkable.is_empty());
+        assert!(citations(&json!({})).checkable.is_empty());
     }
 
     #[test]
@@ -885,9 +926,9 @@ mod tests {
     #[tokio::test]
     async fn only_depth_citations_are_checked() {
         let me = Fake::citing(vec![
-            json!({"claim": "one", "url": "http://1"}),
-            json!({"claim": "two", "url": "http://2"}),
-            json!({"claim": "three", "url": "http://3"}),
+            json!({"claim": "one", "url": "http://one.example"}),
+            json!({"claim": "two", "url": "http://two.example"}),
+            json!({"claim": "three", "url": "http://three.example"}),
         ]);
         let r = research(ResearchArgs {
             question: "q".into(),
@@ -935,7 +976,7 @@ mod tests {
         // held up." and exit 0, as if that were the whole brief.
         let me = Fake::citing(
             (1..=10)
-                .map(|i| json!({"claim": format!("c{i}"), "url": format!("http://{i}")}))
+                .map(|i| json!({"claim": format!("c{i}"), "url": format!("http://c{i}.example")}))
                 .collect(),
         );
         let r = research(ResearchArgs {
@@ -954,7 +995,38 @@ mod tests {
         assert_eq!(exit_code(&r), 1, "a partial verification set is not a clean run");
         let out = render(&r);
         assert!(out.contains("7/10 citations were NOT checked"), "{out}");
+        // The limit, not the count that missed it.
+        assert!(out.contains("beyond --depth 3"), "{out}");
         assert!(!out.contains("held up"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn sources_that_are_not_citations_are_named_not_dropped() {
+        // Two of the brief's three sources are not citations: one names the
+        // metadata service and one repeats an earlier URL. Counting only the
+        // citations would report the brief as fully checked and never mention
+        // the address the verifier must not fetch.
+        let me = Fake::citing(vec![
+            json!({"claim": "one", "url": "http://one.example"}),
+            json!({"claim": "metadata", "url": "http://169.254.169.254/latest/meta-data/"}),
+            json!({"claim": "repeat", "url": "http://one.example"}),
+        ]);
+        let r = research(ResearchArgs {
+            question: "q".into(),
+            angles: None,
+            depth: 3,
+            verify: true,
+            spend: None,
+            ext: Extensions::none(),
+            asker: me.as_ask(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.skipped.len(), 2);
+        assert_eq!(exit_code(&r), 1, "a brief with uncited sources is not a clean run");
+        let out = render(&r);
+        assert!(out.contains("2 sources were not citations"), "{out}");
+        assert!(out.contains("http://169.254.169.254/latest/meta-data/"), "{out}");
     }
 
     #[test]
@@ -969,9 +1041,12 @@ mod tests {
             {"claim": "no scheme", "url": "example.com/a"},
         ]});
         assert_eq!(
-            citations(&brief),
+            citations(&brief).checkable,
             vec![("real".to_string(), "https://example.com/a".to_string())]
         );
+        // The metadata address is not a citation, but it is a source the brief
+        // offered — so it is named, not dropped.
+        assert!(citations(&brief).skipped.contains(&"http://169.254.169.254/latest/meta-data/".to_string()));
     }
 
     #[test]

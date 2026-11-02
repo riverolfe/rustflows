@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ext::Extensions;
-use crate::stats::{Spend, with_stats};
+use crate::stats::Spend;
 use crate::{AskOpts, MAX_CALLS, OrchError, ask, gather};
 
 pub const FINDINGS: fn() -> Value = || json!({
@@ -463,10 +463,6 @@ let chosen: Vec<String> = chosen
 /// True when `lens` is a lens this workflow knows.
 pub fn known_lens(lens: &str) -> bool {
     LENSES.contains(&lens) || OPT_IN_LENSES.contains(&lens)
-}
-
-pub fn summary_line() -> String {
-    with_stats(|s| s.summary())
 }
 
 /// Print the confirmed findings the way the CLI reports them.

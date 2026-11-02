@@ -130,6 +130,9 @@ pub struct UpgradeResult {
     /// Agents that consulted nothing. Not audited, and never counted as safe.
     pub unchecked: usize,
     pub dead: usize,
+    /// The `--depth` the run was given. Reported so "beyond --depth 3" names
+    /// the limit, not the number of findings that missed it.
+    pub depth: usize,
     /// Dependencies the call budget could not afford. Also not audited.
     pub skipped: usize,
     pub confirmed: Vec<Value>,
@@ -441,6 +444,7 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<UpgradeResult, UpgradeError> {
         unchecked,
         dead,
         skipped,
+        depth,
         elapsed: 0.0,
         ..Default::default()
     };
@@ -475,10 +479,13 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<UpgradeResult, UpgradeError> {
             .cmp(&str_field(b, "dependency"))
             .then(str_field(a, "file").cmp(&str_field(b, "file")))
     });
-    let beyond = checkable.split_off(depth);
+    let beyond = checkable.split_off(depth.min(checkable.len()));
     out.unconfirmed.extend(beyond.into_iter().map(|finding| Unconfirmed {
         finding,
-        why: "beyond --depth".into(),
+        // The limit, not the word "depth": a reader cannot otherwise tell
+        // whether a finding was excluded by the limit or by the absence of a
+        // changelog URL.
+        why: format!("beyond --depth {depth}"),
     }));
 
     let batches: Vec<Vec<Value>> = checkable
@@ -611,9 +618,10 @@ pub fn render(r: &UpgradeResult) -> String {
     }
     if !r.unconfirmed.is_empty() {
         out.push_str(&format!(
-            "\n{} candidate breaks were NOT verified (dead or skipped verifier, beyond --depth, \
+            "\n{} candidate breaks were NOT verified (dead or skipped verifier, beyond --depth {}, \
              --no-verify, or no changelog URL):\n",
-            r.unconfirmed.len()
+            r.unconfirmed.len(),
+            r.depth
         ));
         for u in &r.unconfirmed {
             out.push_str(&format!(
@@ -783,6 +791,23 @@ mod tests {
         let out = render(&UpgradeResult { unchecked: 2, audited: 1, ..Default::default() });
         assert!(out.contains("NOT checked"), "{out}");
         assert!(!out.contains("safe to bump"), "{out}");
+    }
+
+    #[test]
+    fn the_depth_limit_is_named_not_just_the_word_depth() {
+        // "beyond --depth" alone cannot be told apart from a finding excluded
+        // for having no changelog URL, so the limit is named.
+        let r = UpgradeResult {
+            target: PathBuf::from("src"),
+            depth: 3,
+            unconfirmed: vec![Unconfirmed {
+                finding: json!({"dependency": "django", "file": "a.py", "line": 1}),
+                why: "beyond --depth 3".into(),
+            }],
+            ..Default::default()
+        };
+        let out = render(&r);
+        assert!(out.contains("beyond --depth 3"), "{out}");
     }
 
     #[test]

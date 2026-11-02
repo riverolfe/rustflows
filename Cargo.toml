@@ -17,6 +17,7 @@ sha2 = "0.10"
 jsonschema = "0"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+url = "2"
 
 [[bin]]
 name = "rustflows"
