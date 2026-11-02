@@ -475,7 +475,7 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<UpgradeResult, UpgradeError> {
             .cmp(&str_field(b, "dependency"))
             .then(str_field(a, "file").cmp(&str_field(b, "file")))
     });
-    let beyond = checkable.split_off(depth);
+    let beyond = checkable.split_off(depth.min(checkable.len()));
     out.unconfirmed.extend(beyond.into_iter().map(|finding| Unconfirmed {
         finding,
         why: "beyond --depth".into(),

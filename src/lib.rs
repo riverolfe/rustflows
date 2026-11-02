@@ -24,13 +24,6 @@ pub static GATE: Semaphore = Semaphore::const_new(8);
 /// failed stage costs one slot, not the round.
 pub const MAX_CALLS: usize = 40;
 
-/// The tools that take a filesystem path, and the input fields holding one.
-pub const PATH_TOOLS: &[(&str, &[&str])] = &[
-    ("Read", &["file_path"]),
-    ("Grep", &["path"]),
-    ("Glob", &["path", "pattern"]),
-];
-
 /// The one error type a workflow must handle. [`OrchError::Budget`] and
 /// [`OrchError::Extension`] are fatal and bubble through [`gather`];
 /// [`OrchError::Seam`] and [`OrchError::Schema`] are raised by [`guard`].
@@ -134,13 +127,12 @@ pub fn cache_key(
         fields.push(Value::String(extensions.to_string()));
     }
     if !reads.is_empty() {
-        fields.push(json_arr(vec![Value::String("reads".into()), Value::String(reads.to_string())]));
+        fields.push(Value::Array(vec![
+            Value::String("reads".into()),
+            Value::String(reads.to_string()),
+        ]));
     }
     sign::hex(&sha2::Sha256::digest(Value::Array(fields).to_string().as_bytes()))[..16].to_string()
-}
-
-fn json_arr(v: Vec<Value>) -> Value {
-    Value::Array(v)
 }
 
 /// One agent call. Returns output that validates against `schema`, else
@@ -442,6 +434,11 @@ pub fn safe_url(url: &str) -> bool {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // The host is after the last '@'. `http://user@169.254.169.254/` reaches
+    // the metadata service, and without this the userinfo hides a literal
+    // address from the parse below — the one form of this check that parses
+    // rather than resolves, and so the one that must not be fooled.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     // Strip the port, but only when it really is one.
     let host = authority
         .rsplit_once(':')
@@ -688,6 +685,8 @@ mod tests {
             "http://example.com/page?q=1",
             "https://example.com:8443/x",
             "https://sub.domain.example.org/",
+            // Userinfo in front of an ordinary public host is still public.
+            "https://user@example.com/x",
         ] {
             assert!(safe_url(ok), "{ok} should be allowed");
         }
@@ -714,6 +713,11 @@ mod tests {
             "http://[fc00::1]/",
             // IPv6-mapped loopback.
             "http://[::ffff:127.0.0.1]/",
+            // Userinfo must not hide a literal address.
+            "http://attacker@169.254.169.254/latest/meta-data/",
+            "http://user:pass@127.0.0.1:9000/",
+            "http://x@[::1]/",
+            "http://x@[::ffff:127.0.0.1]/",
         ] {
             assert!(!safe_url(bad), "{bad} must not be fetched");
         }

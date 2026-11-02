@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn confine_settings_quote_every_root() {
-        let bin = executable_temp_hook();
+        let bin = executable_temp_hook("quote");
         let s = confine_settings(&bin, Path::new("/tmp/a b"), &[PathBuf::from("/tmp/c")]).unwrap();
         assert!(s.contains("Read|Grep|Glob"));
         assert!(s.contains("'/tmp/a b'"));
@@ -370,8 +370,14 @@ mod tests {
     }
 
     /// A file the OS will run, which is what `confine_settings` now requires.
-    fn executable_temp_hook() -> PathBuf {
-        let bin = std::env::temp_dir().join(format!("rustflows-confine-test-{}", std::process::id()));
+    ///
+    /// One path per test: two tests sharing a name deleted each other's hook
+    /// and the loser failed, which is how this became flaky.
+    fn executable_temp_hook(tag: &str) -> PathBuf {
+        let bin = std::env::temp_dir().join(format!(
+            "rustflows-confine-test-{}-{tag}",
+            std::process::id()
+        ));
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -386,7 +392,7 @@ mod tests {
         // This used to be a BTreeMap's keys(), which iterate sorted. An extra
         // root sorting before the cwd — which is what a ~/.claude/skills grant
         // does — put the hook's boundary on the wrong directory.
-        let bin = executable_temp_hook();
+        let bin = executable_temp_hook("order");
         let s = confine_settings(
             &bin,
             Path::new("/repo"),

@@ -131,6 +131,9 @@ pub struct ResearchResult {
     /// reported rather than dropped — the same rule `upgrade` applies to its
     /// `beyond --depth` findings.
     pub over_depth: usize,
+    /// The `--depth` the run was given. Reported so "beyond --depth 3" names
+    /// the limit, not the number of citations that missed it.
+    pub depth: usize,
     pub elapsed: f64,
 }
 
@@ -408,6 +411,7 @@ pub async fn research(args: ResearchArgs) -> Result<ResearchResult, ResearchErro
         gaps: strings(&brief, "gaps"),
         angles_alive: alive.len(),
         angles_dead: chosen - alive.len(),
+        depth,
         ..Default::default()
     };
     if !verify {
@@ -525,7 +529,7 @@ pub fn render(r: &ResearchResult) -> String {
             "\n{}/{} citations were NOT checked — beyond --depth {}\n",
             r.over_depth,
             r.over_depth + r.verified.unwrap_or(0) + r.unsupported.len() + r.unchecked.len(),
-            r.over_depth,
+            r.depth,
         ));
     }
     if r.angles_dead > 0 {
@@ -954,6 +958,8 @@ mod tests {
         assert_eq!(exit_code(&r), 1, "a partial verification set is not a clean run");
         let out = render(&r);
         assert!(out.contains("7/10 citations were NOT checked"), "{out}");
+        // The limit, not the count that missed it.
+        assert!(out.contains("beyond --depth 3"), "{out}");
         assert!(!out.contains("held up"), "{out}");
     }
 

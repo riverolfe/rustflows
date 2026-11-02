@@ -413,9 +413,10 @@ async fn run_decide(
 
     // An advocate plus its judges is about two calls per option.
     let spend = std::sync::Arc::new(rustflows::stats::Spend::new(rustflows::MAX_CALLS));
+    let offered = field.len();
     let (field, capped) = decide::cap_to_budget(&field, spend.remaining());
     if capped {
-        println!("only {}/{} options fit the budget", field.len(), field.len());
+        println!("only {}/{} options fit the budget", field.len(), offered);
     }
     begin(&question, "decide", field.len(), if field.len() == 1 { "option" } else { "options" });
 
