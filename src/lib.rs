@@ -422,46 +422,45 @@ pub fn real_ask() -> AskFn {
 /// the host's metadata service by an agent holding the repo — and `file://` or a
 /// bare path would not even need a server.
 ///
+/// The host is read with a real URL parser rather than by splitting the string,
+/// because every hand-rolled split has a form that hides the host: userinfo
+/// (`http://user@169.254.169.254/`), an empty port (`http://169.254.169.254:/`),
+/// a backslash (`http://169.254.169.254\@x/`), a tab, and the integer form
+/// `http://2130706433/`. The parser normalises all of them to the host that
+/// will actually be requested.
+///
 /// ponytail: string-level only. A public hostname that resolves to a private
 /// address passes, and a redirect to one is not re-checked, because the agent
 /// does the fetching and we never see the resolved address. Pin the egress
 /// instead if that matters: give the call a proxy that only reaches the internet.
 pub fn safe_url(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // The host is after the last '@'. `http://user@169.254.169.254/` reaches
-    // the metadata service, and without this the userinfo hides a literal
-    // address from the parse below — the one form of this check that parses
-    // rather than resolves, and so the one that must not be fooled.
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // Strip the port, but only when it really is one.
-    let host = authority
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty())
-        .map_or(authority, |(h, _)| h)
-        .trim_matches(|c| c == '[' || c == ']')
-        .to_ascii_lowercase();
-    if host.is_empty() {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return false;
     }
-    if host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-    {
-        return false;
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => !blocked_ip(std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => !blocked_ip(std::net::IpAddr::V6(v6)),
+        Some(url::Host::Domain(d)) => {
+            // A trailing dot is the same name: "localhost." is 127.0.0.1.
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            if d.is_empty() {
+                return false;
+            }
+            // "127.0.0.1." is a domain the parser will not normalise, but it
+            // still resolves to 127.0.0.1.
+            if let Ok(ip) = d.parse::<std::net::IpAddr>() {
+                return !blocked_ip(ip);
+            }
+            d != "localhost"
+                && !d.ends_with(".localhost")
+                && !d.ends_with(".local")
+                && !d.ends_with(".internal")
+        }
+        None => false,
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && blocked_ip(ip)
-    {
-        return false;
-    }
-    true
 }
 
 /// An address that reaches this host, this network, or nowhere.
@@ -718,6 +717,22 @@ mod tests {
             "http://user:pass@127.0.0.1:9000/",
             "http://x@[::1]/",
             "http://x@[::ffff:127.0.0.1]/",
+            // An empty port is still a port: the host is 169.254.169.254.
+            "http://169.254.169.254:/latest/meta-data/",
+            "http://127.0.0.1:/",
+            "http://[::1]:/",
+            // A backslash ends the authority, so this is the metadata service.
+            "http://169.254.169.254\\@example.com/",
+            // A tab is stripped before the host is read.
+            "http://169.254.169.254\t/latest/meta-data/",
+            // The same loopback address, written four other ways.
+            "http://2130706433/",
+            "http://127.1/",
+            "http://0x7f000001/",
+            "http://0177.0.0.1/",
+            // A trailing dot is the same name.
+            "http://localhost./",
+            "http://127.0.0.1./",
         ] {
             assert!(!safe_url(bad), "{bad} must not be fetched");
         }
