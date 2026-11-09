@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use crate::ext::Extensions;
 use crate::stats::Spend;
-use crate::{AskFn, MAX_CALLS, OrchError, gather};
+use crate::{AskFn, MAX_CALLS, OrchError, gather, label, str_field};
 
 /// Manifests to look for, in preference order. `package.json` first: a repo with
 /// both a JS and a Python manifest is a JS repo more often than not, and the
@@ -34,8 +34,6 @@ pub const MANIFESTS: &[&str] = &[
 /// A dependency agent reads this repo *and* the web. Without both it either
 /// finds no changelog or reports breaks this repo never hits.
 pub const TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebSearch", "WebFetch"];
-
-const LABEL_MAX: usize = 32;
 
 /// How many candidate breaks one verifier judges. Reading the source dominates
 /// the cost, so judging 5 in one call is far cheaper than 5 that each re-read it.
@@ -174,16 +172,8 @@ impl From<OrchError> for UpgradeError {
     }
 }
 
-fn str_field(v: &Value, key: &str) -> String {
-    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
-}
-
 fn int_field(v: &Value, key: &str) -> i64 {
     v.get(key).and_then(Value::as_i64).unwrap_or(0)
-}
-
-fn label(prefix: &str, what: &str) -> String {
-    format!("{prefix}{what}").chars().take(LABEL_MAX).collect()
 }
 
 /// The manifest this repo uses, if any. Checked before spending a call.
@@ -294,6 +284,7 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<UpgradeResult, UpgradeError> {
     let started = Instant::now();
     let target_arg = target.display().to_string();
     let spend = spend.unwrap_or_else(|| Arc::new(Spend::new(MAX_CALLS)));
+    let mut refused = 0usize;
 
     // Cloned so the closure can borrow it while `target` is still moved into the
 // result below.
@@ -380,11 +371,13 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<UpgradeResult, UpgradeError> {
                         .into(),
                     Arc::clone(&spend),
                 );
-                async move { asker(prompt, BREAKING(), opts).await }
+                async move { crate::tolerate_budget(asker(prompt, BREAKING(), opts).await) }
             })
             .collect(),
     )
     .await?;
+
+    crate::report_unaffordable(&spend, &mut refused);
 
     let mut audited = 0usize;
     let mut unchecked = 0usize;
@@ -511,11 +504,13 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<UpgradeResult, UpgradeError> {
                     "You are an adversarial reviewer. Default to breaks_here=false.".into(),
                     Arc::clone(&spend),
                 );
-                async move { asker(prompt, VERDICTS(), opts).await }
+                async move { crate::tolerate_budget(asker(prompt, VERDICTS(), opts).await) }
             })
             .collect(),
     )
     .await?;
+
+    crate::report_unaffordable(&spend, &mut refused);
 
     for (batch, verdict) in batches.iter().zip(&verdicts) {
         let Some(verdict) = verdict else {

@@ -75,12 +75,20 @@ let found = gather(lenses.iter().map(|lens| ask(&prompt, &FINDINGS, AskOpts {
   payload would otherwise be indistinguishable from a dead agent.
 - **`gather`** — fan-out with `None` in the slot of every failed call.
   `BudgetExhausted` and extension errors bubble: those are the whole run's
-  problem, not one stage's.
+  problem, not one stage's. A fan-out that would rather keep what it has
+  wraps each call in **`tolerate_budget`**, which reads a budget stop as a
+  dead stage: the stages that did run still hold, so a review that runs out of
+  calls reports the findings it verified instead of dying and losing them.
+  Every workflow does this, and says so in its report — a stage that could not
+  be afforded is not a stage that failed.
 - **`guard`** — input-side guardrail. Same validator `ask` uses, so a payload is
   judged by one rule at both ends of a handoff.
 - **`clean`** — strips terminal control characters and bidi overrides from model
   output before it reaches your terminal.
-- **`stat_signature`** — tree fingerprint for the cache key.
+- **`stat_signature`** — tree fingerprint for the cache key. Every regular
+  file counts: an extension allowlist fingerprinted a repo whose language it
+  did not name as *empty*, and an empty fingerprint never moves, so the cache
+  served a review of code that had since changed.
 - **`AskFn`** — the call seam the workflows use instead of `ask` directly, so
   the orchestration invariants are testable without spawning an agent.
 
@@ -211,9 +219,10 @@ cost.
 - **`decide` deduplicates its options before spending a call**, not in the CLI.
   Same outcome, but it holds whatever the caller is.
 
-- **No named-skill support.** The CLI has no `--skills` flag, so a skill name is
-  rejected with an error rather than silently ignored. Grant skills through a
-  plugin dir (`--plugin`) or user settings (`--inherit-settings`).
+- **No named-skill support, and no `--skill` flag either.** The CLI has no way
+  to select a named skill, so it has no flag that claims to. Grant skills
+  through a plugin dir (`--plugin`) or user settings (`--inherit-settings`).
+  A flag that only ever errors is a flag that only ever confuses.
 - **Cache is one JSON file per key**, not sqlite. Small, no native dependency,
   atomic via rename.
 - **Confinement is part of the cache key.** An entry produced while the hook was

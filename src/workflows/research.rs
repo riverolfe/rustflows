@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::ext::Extensions;
 use crate::stats::Spend;
-use crate::{AskFn, MAX_CALLS, OrchError, gather};
+use crate::{AskFn, MAX_CALLS, OrchError, gather, str_field};
 
 /// Web tools and nothing else. A searcher with a filesystem cannot research a
 /// question; it can only read the repo it is standing in.
@@ -135,9 +135,9 @@ pub struct ResearchResult {
     /// the limit, not the number of citations that missed it.
     pub depth: usize,
     /// Sources the brief listed that are not citations we can check: no usable
-    /// URL, or a repeat of one already listed. Reported, not dropped — a brief
-    /// that cited the metadata service must not report as if it never did.
-    /// Empty string where the source named no URL.
+    /// URL, or the same claim and URL listed twice. Reported, not dropped — a
+    /// brief that cited the metadata service must not report as if it never
+    /// did. Empty string where the source named no URL.
     pub skipped: Vec<String>,
     pub elapsed: f64,
 }
@@ -173,10 +173,6 @@ impl From<OrchError> for ResearchError {
     fn from(e: OrchError) -> Self {
         ResearchError::Orch(e)
     }
-}
-
-fn str_field(v: &Value, key: &str) -> String {
-    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 /// Sweepers are blind to each other. A searcher that saw the others' claims
@@ -232,15 +228,15 @@ fn verify_label(url: &str) -> String {
 /// not citations.
 ///
 /// Skips a source that is a bare string (the pre-fix shape), an empty claim, an
-/// empty URL, a URL that must not be fetched, and a claim that *is* its URL — a
+/// empty URL, a URL that must not be fetched, a claim that *is* its URL — a
 /// self-referential claim carries no assertion, so a verifier could only confirm
-/// the page exists.
+/// the page exists — and a claim and URL pair already listed.
 #[derive(Debug, Default)]
 pub struct Citations {
     /// The claims and URLs to check, in the order the brief lists them.
     pub checkable: Vec<(String, String)>,
-    /// Sources that are not citations we can check: no usable URL, or a repeat
-    /// of one already listed. Counted, not dropped — a brief that cited the
+    /// Sources that are not citations we can check: no usable URL, or the same
+    /// claim and URL listed twice. Counted, not dropped — a brief that cited the
     /// metadata service must not report as if it never did. Empty string where
     /// the source named no URL.
     pub skipped: Vec<String>,
@@ -248,7 +244,11 @@ pub struct Citations {
 
 pub fn citations(brief: &Value) -> Citations {
     let mut out = Citations::default();
-    let mut seen: HashSet<String> = HashSet::new();
+    // The identity is the *pair*. The same page cited for two different
+    // assertions is two assertions to check, not one URL listed twice — and
+    // dropping the second reported a perfectly good brief as citing a source
+    // that is not a citation, then failed the whole run over it.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     let Some(sources) = brief.get("sources").and_then(Value::as_array) else {
         return out;
     };
@@ -262,7 +262,7 @@ pub fn citations(brief: &Value) -> Citations {
             out.skipped.push(url);
             continue;
         }
-        if !seen.insert(url.clone()) {
+        if !seen.insert((claim.clone(), url.clone())) {
             out.skipped.push(url);
             continue;
         }
@@ -317,6 +317,7 @@ pub async fn research(args: ResearchArgs) -> Result<ResearchResult, ResearchErro
     } = args;
     let started = Instant::now();
     let spend = spend.unwrap_or_else(|| Arc::new(Spend::new(MAX_CALLS)));
+    let mut refused = 0usize;
 
     let chosen = angles.unwrap_or(ANGLE_NAMES.len()).min(ANGLE_NAMES.len());
     // A configuration mistake, not dead agents: `gather` over no futures
@@ -341,24 +342,28 @@ pub async fn research(args: ResearchArgs) -> Result<ResearchResult, ResearchErro
                 let asker = Arc::clone(&asker);
                 let spend = Arc::clone(&spend);
                 async move {
-                    asker(
-                        prompt,
-                        FINDINGS(),
-                        crate::AskOpts {
-                            tools: WEB.iter().map(|s| s.to_string()).collect(),
-                            ext,
-                            label,
-                            system: Some(format!("You research via {angle}. Every claim needs a source URL.")),
-                            spend: Some(spend),
-                            ..Default::default()
-                        },
+                    crate::tolerate_budget(
+                        asker(
+                            prompt,
+                            FINDINGS(),
+                            crate::AskOpts {
+                                tools: WEB.iter().map(|s| s.to_string()).collect(),
+                                ext,
+                                label,
+                                system: Some(format!("You research via {angle}. Every claim needs a source URL.")),
+                                spend: Some(spend),
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
-                    .await
                 }
             })
             .collect(),
     )
     .await?;
+
+    crate::report_unaffordable(&spend, &mut refused);
 
     let alive: Vec<&Value> = found.iter().flatten().collect();
     if alive.is_empty() {
@@ -462,24 +467,30 @@ pub async fn research(args: ResearchArgs) -> Result<ResearchResult, ResearchErro
                 let asker = Arc::clone(&asker);
                 let spend = Arc::clone(&spend);
                 async move {
-                    asker(
-                        prompt,
-                        VERDICT(),
-                        crate::AskOpts {
-                            tools: WEB.iter().map(|s| s.to_string()).collect(),
-                            ext,
-                            label,
-                            system: Some("You check citations. Default to unsupported.".into()),
-                            spend: Some(spend),
-                            ..Default::default()
-                        },
+                    crate::tolerate_budget(
+                        asker(
+                            prompt,
+                            VERDICT(),
+                            crate::AskOpts {
+                                tools: WEB.iter().map(|s| s.to_string()).collect(),
+                                ext,
+                                label,
+                                system: Some("You check citations. Default to unsupported.".into()),
+                                spend: Some(spend),
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
-                    .await
                 }
             })
             .collect(),
     )
     .await?;
+
+    // A citation check the budget could not afford checked nothing — it is
+    // unchecked, not refuted. The count says how many.
+    crate::report_unaffordable(&spend, &mut refused);
 
     // Guarded on `targets` being non-empty, which it is above: an empty list
     // would vacuously satisfy this and report a clean run having checked nothing.
@@ -557,12 +568,14 @@ pub fn render(r: &ResearchResult) -> String {
     }
     if !r.skipped.is_empty() {
         out.push_str(&format!(
-            "\n{} sources were not citations — no usable URL, or a repeat of one already \
-             listed:\n",
+            "\n{} sources were not citations — no usable URL, or the same claim and URL \
+             listed twice:\n",
             r.skipped.len()
         ));
-        for u in r.skipped.iter().filter(|u| !u.is_empty()) {
-            out.push_str(&format!("  {u}\n"));
+        for u in &r.skipped {
+            // Every skipped source is named. The count and the list must agree:
+            // a source with no URL at all was counted but printed as nothing.
+            out.push_str(&format!("  {}\n", if u.is_empty() { "(no URL)" } else { u }));
         }
     }
     if r.angles_dead > 0 {
@@ -814,25 +827,47 @@ mod tests {
 
     #[test]
     fn a_citation_carries_a_real_claim_not_a_bare_url() {
-        // All four skip rules at once.
+        // All the skip rules at once.
         let brief = json!({"sources": [
             {"claim": "uv ships 3.14t builds", "url": "http://a"},
             {"claim": "http://b", "url": "http://b"},
             {"claim": "", "url": "http://c"},
             {"claim": "s", "url": ""},
             {"claim": "another claim", "url": "http://a"},
+            {"claim": "uv ships 3.14t builds", "url": "http://a"},
             "a bare string from the pre-fix shape",
         ]});
         assert_eq!(
             citations(&brief).checkable,
-            vec![("uv ships 3.14t builds".to_string(), "http://a".to_string())]
+            vec![
+                ("uv ships 3.14t builds".to_string(), "http://a".to_string()),
+                // The same page, a different assertion: two citations.
+                ("another claim".to_string(), "http://a".to_string()),
+            ]
         );
         // Four sources named something that is not a citation: a claim that is
-        // the URL, no claim, no URL, and a repeat of the first. Counted, so
-        // the report can say the brief offered more than it checked.
+        // the URL, no claim, no URL, and a repeat of the first claim and URL.
+        // Counted, so the report can say the brief offered more than it checked.
         assert_eq!(citations(&brief).skipped.len(), 4);
         assert!(citations(&json!({"sources": ["just a string"]})).checkable.is_empty());
         assert!(citations(&json!({})).checkable.is_empty());
+    }
+
+    #[test]
+    fn the_same_url_cited_for_two_claims_is_two_citations_not_a_repeat() {
+        // The dedup was on the URL alone, so a brief that cited one article
+        // for two assertions reported the second as "not a citation" — and the
+        // run failed over it, for a brief that was perfectly well formed.
+        let brief = json!({"sources": [
+            {"claim": "one", "url": "http://a.example"},
+            {"claim": "two", "url": "http://a.example"},
+        ]});
+        let c = citations(&brief);
+        assert_eq!(c.checkable.len(), 2, "two assertions, two checks");
+        assert!(
+            c.skipped.is_empty(),
+            "a page cited twice is not a source that is not a citation"
+        );
     }
 
     #[test]
@@ -1001,15 +1036,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_brief_citing_one_article_for_two_claims_is_a_clean_run() {
+        // The run failed over a brief that cited the same page for two
+        // different assertions: the second was reported as a source that is
+        // not a citation, and the brief as partial.
+        let me = Fake::citing(vec![
+            json!({"claim": "one", "url": "http://one.example"}),
+            json!({"claim": "two", "url": "http://one.example"}),
+        ]);
+        let r = research(ResearchArgs {
+            question: "q".into(),
+            angles: None,
+            depth: 3,
+            verify: true,
+            spend: None,
+            ext: Extensions::none(),
+            asker: me.as_ask(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.verified, Some(2), "both assertions were checked");
+        assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+        assert_eq!(exit_code(&r), 0, "a well-formed brief is not a partial run");
+        assert_eq!(me.count("actually support"), 2, "one check per assertion");
+    }
+
+    #[tokio::test]
     async fn sources_that_are_not_citations_are_named_not_dropped() {
         // Two of the brief's three sources are not citations: one names the
-        // metadata service and one repeats an earlier URL. Counting only the
-        // citations would report the brief as fully checked and never mention
-        // the address the verifier must not fetch.
+        // metadata service and one repeats an earlier claim and URL. Counting
+        // only the citations would report the brief as fully checked and never
+        // mention the address the verifier must not fetch.
         let me = Fake::citing(vec![
             json!({"claim": "one", "url": "http://one.example"}),
             json!({"claim": "metadata", "url": "http://169.254.169.254/latest/meta-data/"}),
-            json!({"claim": "repeat", "url": "http://one.example"}),
+            json!({"claim": "one", "url": "http://one.example"}),
         ]);
         let r = research(ResearchArgs {
             question: "q".into(),

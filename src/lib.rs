@@ -209,16 +209,26 @@ its path."
         );
     }
 
+    // The canonical root, not the path as it was spelled: the run happens in
+    // the canonical directory and the fingerprint walks the canonical tree, so
+    // the key has to name the same tree. `review .` and `review /abs/path` are
+    // one tree and were two cache entries.
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let dep_signature = match depends_on.as_deref() {
+        Some(d) => {
+            let d = d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
+            sign::stat_signature(&d, None)
+        }
+        None => String::new(),
+    };
+
     let key = cache_key(
         prompt,
         schema,
         &tools,
         system.as_deref().unwrap_or(""),
-        &cwd.display().to_string(),
-        &depends_on
-            .as_deref()
-            .map(|d| sign::stat_signature(d, None))
-            .unwrap_or_default(),
+        &root.display().to_string(),
+        &dep_signature,
         &format!("confined={confined};{}", ext.key()),
         &if extra_reads.is_empty() {
             String::new()
@@ -237,7 +247,6 @@ its path."
             return Ok(Some(clean(&hit))); // entries cached before cleaning existed
         }
 
-    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
     let mut hook_roots = resolved.reads.clone();
     hook_roots.append(&mut extra_reads);
 
@@ -507,10 +516,51 @@ fn budget_error(label: &str, max_budget_usd: Option<f64>, spent: f64) -> OrchErr
     })
 }
 
+/// Treat a budget stop as a dead stage rather than a fatal error.
+///
+/// A budget stop means the run could not afford this stage — not that the
+/// stage, or the run, is invalid. The stages that did run still hold, so a
+/// fan-out that runs out of calls reports a partial result instead of
+/// throwing away every stage that already finished. A review of a repo with
+/// two hundred findings used to die at the budget ceiling and lose the
+/// hundred and eighty it had already verified.
+///
+/// [`OrchError::Extension`] stays fatal: a bad extension is the whole run's
+/// problem, not one stage's.
+///
+/// The caller is expected to say so in its report — a stage that could not be
+/// afforded is not a stage that failed, and the two must not read alike.
+///
+/// A stage that hit its own per-call USD ceiling lands here too: it produced
+/// nothing, so the workflow reports it as a dead stage rather than as a
+/// shortfall. No workflow sets a per-call ceiling, so in practice this is the
+/// run's budget.
+pub fn tolerate_budget<T>(result: Result<Option<T>, OrchError>) -> Result<Option<T>, OrchError> {
+    match result {
+        Err(OrchError::Budget(_)) => Ok(None),
+        other => other,
+    }
+}
+
+/// Print how many stages the budget could not afford, if that number moved.
+///
+/// A stage that could not be afforded is not a stage that failed, and the two
+/// must not read alike: "we ran out of calls" is a shortfall the run can
+/// report, "the agent died" is a stage that needs another look. The count only
+/// grows, so each fan-out reports what it added.
+pub fn report_unaffordable(spend: &stats::Spend, last: &mut usize) {
+    let now = spend.refused();
+    if now != *last {
+        println!("  {now} stage(s) could not be afforded — the call budget ran out");
+        *last = now;
+    }
+}
+
 /// `join_all` with `None` in the slot of every call that failed.
 ///
 /// [`OrchError`] bubbles: a budget stop or a bad extension is the whole run's
-/// problem, not one stage's.
+/// problem, not one stage's. A fan-out that wants a budget stop to read as a
+/// dead stage wraps each call in [`tolerate_budget`].
 pub async fn gather<F, T>(futures: Vec<F>) -> Result<Vec<Option<T>>, OrchError>
 where
     F: std::future::Future<Output = Result<Option<T>, OrchError>> + Send,
@@ -534,6 +584,25 @@ where
         }
     }
     Ok(out)
+}
+
+/// A stage label that fits the panel's stage column.
+///
+/// The panel truncates a longer label from the left, so a label that overflows
+/// is a label that names the wrong stage. Every workflow bounds its labels
+/// against the same width, in one place, so a workflow that forgets cannot
+/// quietly disagree with the column it is printed in.
+pub fn label(prefix: &str, what: &str) -> String {
+    format!("{prefix}{what}").chars().take(panel::STAGE_COL).collect()
+}
+
+/// A string field of a payload, or the empty string.
+///
+/// The empty string, not a placeholder: a payload that left the field out has
+/// no value for it, and every caller here wants "nothing" rather than a panic
+/// or a guess.
+pub fn str_field(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 /// Locate the `confine` PreToolUse hook binary: next to this executable first,
@@ -622,6 +691,26 @@ mod tests {
         assert!(e.contains("$0.0322"), "{e}");
         let e = budget_error("x", None, 1.5).to_string();
         assert!(e.contains("$1.5000"), "{e}");
+    }
+
+    #[test]
+    fn a_budget_stop_is_a_dead_stage_but_a_bad_extension_is_not() {
+        // The budget stop is the whole run's problem only if it ends the run.
+        // A fan-out that treats it as a dead stage keeps every stage that did
+        // run; an extension error is genuinely fatal.
+        match tolerate_budget::<Value>(Err(OrchError::Budget("gone".into()))) {
+            Ok(None) => {}
+            other => panic!("a budget stop must read as a dead stage: {other:?}"),
+        }
+        assert!(matches!(
+            tolerate_budget::<Value>(Err(OrchError::Extension("bad".into()))),
+            Err(OrchError::Extension(_))
+        ));
+        // And a stage that succeeded is untouched.
+        match tolerate_budget::<Value>(Ok(Some(json!({"a": 1})))) {
+            Ok(Some(v)) => assert_eq!(v, json!({"a": 1})),
+            other => panic!("a live stage must come back unchanged: {other:?}"),
+        }
     }
 
     #[tokio::test]

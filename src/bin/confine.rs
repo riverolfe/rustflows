@@ -173,10 +173,23 @@ fn expanduser(path: &Path) -> PathBuf {
         None if s == "~" => "",
         None => return path.to_path_buf(),
     };
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => PathBuf::from(home).join(rest),
-        _ => path.to_path_buf(),
+    match home_dir() {
+        Some(home) => home.join(rest),
+        None => path.to_path_buf(),
     }
+}
+
+/// The home directory, the same way the library finds it.
+///
+/// `HOME` first, then `USERPROFILE`: a Windows shell sets the second, and a
+/// hook that looked only at the first would read `~` as a directory named `~`
+/// on the machine that has no `HOME` — the exact divergence the
+/// `the_hook_agrees_with_ext_on_expanding_a_tilde` test exists to catch.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Lexical normalisation: collapse `.` and `..` without touching the
@@ -381,5 +394,20 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_hook_and_the_library_agree_on_where_home_is() {
+        // The two copies of `expanduser` must also agree on *which* directory
+        // `~` is. A Windows shell sets USERPROFILE and not HOME, so a hook that
+        // looked only at HOME would read `~` as a directory named `~`.
+        assert_eq!(home_dir(), rustflows::ext::home_dir());
+        assert_eq!(
+            home_dir(),
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
+        );
     }
 }

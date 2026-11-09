@@ -3,8 +3,10 @@
 //! `plugins` — local plugin dirs, passed as `--plugin-dir`.
 //! `mcp`     — MCP server configs by name; their `mcp__<name>` tools are allowed.
 //! `inherit` — load user, project and local settings, all skills and MCP servers.
-//! `skills`  — named skills. The CLI has no flag to select one, so a name is
-//!             rejected here instead of being dropped silently.
+//!
+//! There is no named-skill grant: the CLI has no flag to select one, so a
+//! skill reaches a run through a plugin dir or through user settings. A flag
+//! that only ever errors is a flag that only ever confuses.
 
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
@@ -15,7 +17,6 @@ pub const USER_SKILLS: &str = "~/.claude/skills";
 
 #[derive(Debug, Clone, Default)]
 pub struct Extensions {
-    pub skills: Vec<String>,
     pub plugins: Vec<String>,
     pub mcp: Map<String, Value>,
     pub inherit: bool,
@@ -28,31 +29,17 @@ impl Extensions {
 
     /// Cache-key part; empty for the default.
     pub fn key(&self) -> String {
-        if self.skills.is_empty()
-            && self.plugins.is_empty()
-            && self.mcp.is_empty()
-            && !self.inherit
-        {
+        if self.plugins.is_empty() && self.mcp.is_empty() && !self.inherit {
             return String::new();
         }
         let mut plugins = self.plugins.clone();
         plugins.sort();
-        let mut skills = self.skills.clone();
-        skills.sort();
-        json!([skills, plugins, Value::Object(self.mcp.clone()), self.inherit]).to_string()
+        json!([plugins, Value::Object(self.mcp.clone()), self.inherit]).to_string()
     }
 
     /// What the runner needs: plugin dirs, MCP servers, extra read roots and
     /// which setting sources to load.
     pub fn resolve(&self) -> Result<Resolved, OrchError> {
-        if !self.skills.is_empty() {
-            return Err(OrchError::Extension(format!(
-                "named skills ({}) have no CLI flag to select them; grant them through a \
-plugin dir with --plugin, or load user settings with --inherit-settings",
-                self.skills.join(", ")
-            )));
-        }
-
         let mut plugins = Vec::new();
         for p in &self.plugins {
             let path = expanduser(Path::new(p));
@@ -147,14 +134,6 @@ mod tests {
         assert_eq!(a.key(), b.key());
         assert_ne!(a.key(), c.key());
         assert_ne!(a.key(), "");
-    }
-
-    #[test]
-    fn named_skills_are_rejected_rather_than_dropped() {
-        let ext = Extensions { skills: vec!["pdf".into()], ..Default::default() };
-        let err = ext.resolve().unwrap_err();
-        assert!(matches!(err, OrchError::Extension(_)));
-        assert!(err.to_string().contains("--inherit-settings"));
     }
 
     #[test]
