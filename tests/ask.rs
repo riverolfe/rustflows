@@ -153,6 +153,27 @@ async fn an_error_result_is_a_dead_stage_while_a_good_one_is_returned_and_cached
     assert_eq!(out, Some(serde_json::json!({"answer": "pong"})));
     assert_eq!(cache_entries(&cache), 1, "a good result must be cached");
 
+    // The cache key names the tree, not the way it was spelled: the same
+    // directory reached by two paths is one entry, not two.
+    let spelled = std::env::temp_dir().join(".");
+    let out = ask(
+        "q",
+        &schema(),
+        AskOpts {
+            cwd: spelled,
+            max_budget_usd: Some(1.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a cache hit is not an error");
+    assert_eq!(out, Some(serde_json::json!({"answer": "pong"})));
+    assert_eq!(
+        cache_entries(&cache),
+        1,
+        "the same tree must be one cache entry, however it was spelled"
+    );
+
     // An agent that narrates instead of calling StructuredOutput arrives as
     // `subtype: success, is_error: false` with no payload — which is what kept
     // killing the performance lens. That used to be a dead `no_output` with no

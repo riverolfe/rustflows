@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::ext::Extensions;
 use crate::stats::Spend;
-use crate::{AskFn, MAX_CALLS, OrchError, gather};
+use crate::{AskFn, MAX_CALLS, OrchError, gather, label, str_field};
 
 /// An advocate's case for one option.
 pub const CASE: fn() -> Value = || json!({
@@ -43,10 +43,6 @@ pub const PAIR: fn() -> Value = || json!({
     },
     "required": ["winner", "why"],
 });
-
-/// The stage column is 32 wide; a longer label is truncated in the panel, but a
-/// truncated label is also a label that names the wrong option.
-const LABEL_MAX: usize = 32;
 
 /// An option with a live advocate, carrying its case.
 #[derive(Debug, Clone)]
@@ -189,11 +185,6 @@ pub fn cap_to_budget(field: &[String], budget: usize) -> (Vec<String>, bool) {
     (field[..fits.min(field.len())].to_vec(), true)
 }
 
-fn label(prefix: &str, what: &str) -> String {
-    let raw = format!("{prefix}{what}");
-    raw.chars().take(LABEL_MAX).collect()
-}
-
 /// Which side a verdict picked, in the order the prompt presented.
 ///
 /// `None` for a dead judge and for a verdict whose `winner` is missing or out of
@@ -259,6 +250,7 @@ pub async fn decide(args: DecideArgs) -> Result<Brief, DecideError> {
         ));
     }
     let spend = spend.unwrap_or_else(|| Arc::new(Spend::new(MAX_CALLS)));
+    let mut refused = 0usize;
 
     // Advocates and judges run with no tools: the answer depends on the prompt
     // alone, so there is nothing to read and nothing to fingerprint.
@@ -273,24 +265,28 @@ pub async fn decide(args: DecideArgs) -> Result<Brief, DecideError> {
                 let asker = Arc::clone(&asker);
                 let spend = Arc::clone(&spend);
                 async move {
-                    asker(
-                        prompt,
-                        CASE(),
-                        crate::AskOpts {
-                            tools: Vec::new(),
-                            ext,
-                            label,
-                            system: Some("You advocate one option, alone. Be its best advocate.".into()),
-                            spend: Some(spend),
-                            ..Default::default()
-                        },
+                    crate::tolerate_budget(
+                        asker(
+                            prompt,
+                            CASE(),
+                            crate::AskOpts {
+                                tools: Vec::new(),
+                                ext,
+                                label,
+                                system: Some("You advocate one option, alone. Be its best advocate.".into()),
+                                spend: Some(spend),
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
-                    .await
                 }
             })
             .collect(),
     )
     .await?;
+
+    crate::report_unaffordable(&spend, &mut refused);
 
     // An option whose advocate died did not lose the tournament, it never
     // played. Different thing, and the difference is the whole point.
@@ -300,8 +296,8 @@ pub async fn decide(args: DecideArgs) -> Result<Brief, DecideError> {
         match case {
             Some(c) => contenders.push(Contender {
                 option: option.clone(),
-                plan: c.get("plan").and_then(Value::as_str).unwrap_or("").to_string(),
-                caveat: c.get("caveat").and_then(Value::as_str).unwrap_or("").to_string(),
+                plan: str_field(&c, "plan"),
+                caveat: str_field(&c, "caveat"),
             }),
             None => no_case.push(option.clone()),
         }
@@ -343,24 +339,28 @@ pub async fn decide(args: DecideArgs) -> Result<Brief, DecideError> {
                     let asker = Arc::clone(&asker);
                     let spend = Arc::clone(&spend);
                     async move {
-                        asker(
-                            prompt,
-                            PAIR(),
-                            crate::AskOpts {
-                                tools: Vec::new(),
-                                ext,
-                                label,
-                                system: Some("You are an impartial judge. One winner or nothing.".into()),
-                                spend: Some(spend),
-                                ..Default::default()
-                            },
+                        crate::tolerate_budget(
+                            asker(
+                                prompt,
+                                PAIR(),
+                                crate::AskOpts {
+                                    tools: Vec::new(),
+                                    ext,
+                                    label,
+                                    system: Some("You are an impartial judge. One winner or nothing.".into()),
+                                    spend: Some(spend),
+                                    ..Default::default()
+                                },
+                            )
+                            .await,
                         )
-                        .await
                     }
                 })
                 .collect(),
         )
         .await?;
+
+        crate::report_unaffordable(&spend, &mut refused);
 
         let mut next: Vec<Contender> = Vec::new();
         // Verdict by verdict over the JUDGED games only. Zipping the two lists

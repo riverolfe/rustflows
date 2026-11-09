@@ -11,7 +11,7 @@ use crate::clean::clean_text;
 use crate::stats::{read_last_run, read_runs, run_log_path};
 
 /// The stage column below is the contract every workflow labels against.
-const STAGE_COL: usize = 32;
+pub const STAGE_COL: usize = 32;
 
 fn outcome_style(outcome: &str) -> (&'static str, &'static str) {
     match outcome {

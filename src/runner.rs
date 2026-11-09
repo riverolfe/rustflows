@@ -126,8 +126,8 @@ pub fn argv(spec: &CallSpec) -> Vec<String> {
         a.extend(["--plugin-dir".into(), p.display().to_string()]);
     }
     // No `--skills` flag exists: a named skill is granted by the plugin that
-    // ships it, or by loading user settings. Extensions rejects the case the
-    // flag would have covered rather than dropping the grant silently.
+    // ships it, or by loading user settings. There is no flag to select one,
+    // so there is nothing here to pass.
     if let Some(servers) = spec.mcp_servers.as_object()
         && !servers.is_empty() {
             a.extend(["--mcp-config".into(), spec.mcp_servers.to_string()]);

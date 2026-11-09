@@ -105,22 +105,20 @@ enum Command {
 /// Extensions (agents load none unless named).
 #[derive(clap::Args)]
 struct ExtArgs {
-    /// Load a local plugin dir (repeatable).
+    /// Load a local plugin dir (repeatable). A plugin is how a skill is
+    /// granted: the CLI has no flag to select a named skill.
     #[arg(long = "plugin", value_name = "DIR")]
     plugin: Vec<String>,
     /// Load your *user* settings, skills and MCP servers. The target repo's own
     /// settings are never loaded: a reviewed tree must not supply the rules.
+    /// Bash, Write and Edit stay denied, so a skill that needs them cannot run.
     #[arg(long = "inherit-settings")]
     inherit_settings: bool,
-    /// Grant a user skill. Rejected: the CLI has no flag to select a named skill.
-    #[arg(long = "skill", value_name = "NAME")]
-    skill: Vec<String>,
 }
 
 impl ExtArgs {
     fn into_extensions(self) -> Extensions {
         Extensions {
-            skills: self.skill,
             plugins: self.plugin,
             mcp: serde_json::Map::new(),
             inherit: self.inherit_settings,
@@ -226,7 +224,14 @@ async fn run_review(
         target.display()
     );
 
-    let result = review(ReviewArgs { target, lenses: chosen.clone(), batch_size, ext }).await;
+    let result = review(ReviewArgs {
+        target,
+        lenses: chosen.clone(),
+        batch_size,
+        ext,
+        asker: rustflows::real_ask(),
+    })
+    .await;
     let result = match result {
         Ok(r) => r,
         Err(ReviewError::Failed(m)) | Err(ReviewError::Orch(rustflows::OrchError::Budget(m))) => {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::ext::Extensions;
 use crate::stats::Spend;
-use crate::{AskOpts, MAX_CALLS, OrchError, ask, gather};
+use crate::{AskFn, AskOpts, MAX_CALLS, OrchError, gather};
 
 pub const FINDINGS: fn() -> Value = || json!({
     "type": "object",
@@ -201,6 +201,11 @@ pub struct ReviewArgs {
     pub lenses: Vec<String>,
     pub batch_size: Option<usize>,
     pub ext: Extensions,
+    /// The seam the stages call instead of [`crate::ask`] directly, so the
+    /// invariants that matter most here — *a dead verifier leaves its claims
+    /// unconfirmed rather than refuted*, *a budget stop throws nothing away* —
+    /// are testable without spawning an agent.
+    pub asker: AskFn,
 }
 
 /// Review `target` and return the findings that survived refutation.
@@ -211,7 +216,7 @@ pub struct ReviewArgs {
 /// `batch_size` `None` means one verifier per batch of `batch_size_default()`
 /// findings; pass a value >= the finding count to force a single verifier.
 pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
-    let ReviewArgs { target, lenses, batch_size, ext } = args;
+    let ReviewArgs { target, lenses, batch_size, ext, asker } = args;
     // A configuration mistake, not a dead agent: `gather` over no futures
     // succeeds, so this used to fall through to "all 0 lenses failed" and exit
     // 1, pointing the reader at agents that never ran.
@@ -229,6 +234,7 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
     // `chunks(0)` panics. The CLI cannot pass 0, but `ReviewArgs` is public API.
     let batch_size = batch_size.unwrap_or_else(batch_size_default).max(1);
     let spend = Arc::new(Spend::new(MAX_CALLS));
+    let mut refused = 0usize;
 
     let found = gather(
         lenses
@@ -241,23 +247,32 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
                 let dep = Some(target.clone());
                 let ext = ext.clone();
                 let spend = Arc::clone(&spend);
+                let asker = Arc::clone(&asker);
                 async move {
-                    ask(&prompt, &FINDINGS(), AskOpts {
-                        spend: Some(spend),
-                        ext,
-                        cwd,
-                        depends_on: dep,
-                        label,
-                        system: Some(system),
-                        ..Default::default()
-                    })
-                    .await
+                    crate::tolerate_budget(
+                        asker(
+                            prompt,
+                            FINDINGS(),
+                            AskOpts {
+                                spend: Some(spend),
+                                ext,
+                                cwd,
+                                depends_on: dep,
+                                label,
+                                system: Some(system),
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                    )
                 }
             })
             .collect(),
     )
     .await
     .map_err(ReviewError::Orch)?;
+
+    crate::report_unaffordable(&spend, &mut refused);
 
     // A dead lens and a lens that found nothing are both None here — count the
     // dead ones, or "reviewed nothing" reads as "found nothing".
@@ -329,34 +344,42 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                // The panel's stage column is 32 wide, and every sibling workflow bounds its
-                // labels. This one interpolates a full agent-supplied path.
-                let label = format!("verify/{first_file}:{}", batch.len())
-                    .chars()
-                    .take(32)
-                    .collect::<String>();
+                // This one interpolates a full agent-supplied path, so it
+                // needs the panel's stage column more than its siblings do.
+                let label = crate::label("verify/", &format!("{first_file}:{}", batch.len()));
                 let cwd = target.clone();
                 let dep = Some(target.clone());
                 let ext = ext.clone();
                 let spend = Arc::clone(&spend);
+                let asker = Arc::clone(&asker);
                 async move {
-                    ask(&prompt, &BATCH(), AskOpts {
-                        spend: Some(spend),
-                        ext,
-                        cwd,
-                        depends_on: dep,
-                        label,
-                        system: Some("You are an adversarial reviewer. Default to refuted=true.".into()),
-                        tools: vec!["Read".into(), "Grep".into()],
-                        ..Default::default()
-                    })
-                    .await
+                    crate::tolerate_budget(
+                        asker(
+                            prompt,
+                            BATCH(),
+                            AskOpts {
+                                spend: Some(spend),
+                                ext,
+                                cwd,
+                                depends_on: dep,
+                                label,
+                                system: Some("You are an adversarial reviewer. Default to refuted=true.".into()),
+                                tools: vec!["Read".into(), "Grep".into()],
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                    )
                 }
             })
             .collect(),
     )
     .await
     .map_err(ReviewError::Orch)?;
+
+    // A batch the budget could not afford is not a batch that failed. The
+    // findings in it are unconfirmed either way, but the report must say which.
+    crate::report_unaffordable(&spend, &mut refused);
 
     let mut confirmed = Vec::new();
     let mut unconfirmed = 0usize;
@@ -398,7 +421,10 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewResult, ReviewError> {
     }
 
     if unconfirmed > 0 {
-        println!("  {unconfirmed}/{} findings unconfirmed (failed or skipped)", unique.len());
+        println!(
+            "  {unconfirmed}/{} findings unconfirmed (failed, skipped, or unaffordable)",
+            unique.len()
+        );
     }
 
     // Every verifier dead is a dead run, not a clean one — same rule as the find
@@ -503,6 +529,63 @@ pub fn check_target(target: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::schema::schema_error;
+
+    /// A fake that answers the finders, and stops affording verification
+    /// batches after `affords` of them.
+    struct Fake {
+        affords: usize,
+        verified: std::sync::Mutex<usize>,
+    }
+
+    impl Fake {
+        fn as_ask(self: &Arc<Self>) -> AskFn {
+            let me = Arc::clone(self);
+            Arc::new(move |prompt: String, _schema: Value, _opts: AskOpts| {
+                let me = Arc::clone(&me);
+                Box::pin(async move {
+                    if prompt.contains("REFUTE") {
+                        let mut n = me.verified.lock().expect("verified mutex");
+                        *n += 1;
+                        if *n > me.affords {
+                            // What `ask` returns when the run is out of calls.
+                            return Err(OrchError::Budget("exhausted 40-call budget".into()));
+                        }
+                        // One claim per batch, so the index is always 0.
+                        return Ok(Some(json!({
+                            "verdicts": [{"index": 0, "refuted": false, "reason": "the code backs it"}]
+                        })));
+                    }
+                    Ok(Some(json!({"findings": [
+                        {"file": "a.rs", "line": 1, "summary": "s1", "failure": "f1"},
+                        {"file": "b.rs", "line": 2, "summary": "s2", "failure": "f2"},
+                    ]})))
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_budget_stop_does_not_throw_away_the_findings_already_verified() {
+        // The bug: the verify fan-out bubbled a budget stop out of `gather`, so
+        // a review of a repo with more findings than the budget could verify
+        // died — and every batch that had already answered went with it.
+        let f = Arc::new(Fake { affords: 1, verified: std::sync::Mutex::new(0) });
+        let r = review(ReviewArgs {
+            target: PathBuf::from("."),
+            lenses: vec!["correctness".into()],
+            batch_size: Some(1),
+            ext: Extensions::none(),
+            asker: f.as_ask(),
+        })
+        .await
+        .expect("a budget stop is not a failed run");
+
+        // Two findings, two batches of one: the first was verified, the second
+        // could not be afforded.
+        assert_eq!(r.confirmed.len(), 1, "the verified finding survives");
+        assert_eq!(r.unconfirmed, 1, "the unaffordable one is unconfirmed");
+        assert_eq!(r.dead, 0, "no lens died");
+    }
 
     #[test]
     fn dedup_key_separates_two_default_lenses_on_the_same_line() {

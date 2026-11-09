@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::runner::CallResult;
@@ -296,6 +297,8 @@ pub fn read_runs() -> Vec<Vec<Value>> {
 pub struct Spend {
     pub max_calls: usize,
     pub remaining: Mutex<usize>,
+    /// Calls refused because the budget was gone.
+    refused: AtomicUsize,
 }
 
 impl Spend {
@@ -303,12 +306,14 @@ impl Spend {
         Self {
             max_calls,
             remaining: Mutex::new(max_calls),
+            refused: AtomicUsize::new(0),
         }
     }
 
     pub fn take(&self) -> Result<(), crate::OrchError> {
         let mut remaining = self.remaining.lock().expect("spend mutex poisoned");
         if *remaining == 0 {
+            self.refused.fetch_add(1, Ordering::Relaxed);
             return Err(crate::OrchError::Budget(format!(
                 "exhausted {}-call budget",
                 self.max_calls
@@ -316,6 +321,15 @@ impl Spend {
         }
         *remaining -= 1;
         Ok(())
+    }
+
+    /// How many calls were refused because the budget was gone.
+    ///
+    /// A refused call is a stage the run could not afford — not a stage that
+    /// failed. The workflows report the two separately, so "we ran out of
+    /// calls" never reads as "the agent died".
+    pub fn refused(&self) -> usize {
+        self.refused.load(Ordering::Relaxed)
     }
 
     /// What is left, without spending any.
@@ -423,6 +437,16 @@ mod tests {
         assert!(spend.take().is_ok());
         assert!(spend.take().is_ok());
         assert!(spend.take().is_err());
+    }
+
+    #[test]
+    fn a_refused_call_is_counted_so_it_can_be_told_from_a_dead_agent() {
+        let spend = Spend::new(1);
+        assert!(spend.take().is_ok());
+        assert_eq!(spend.refused(), 0);
+        assert!(spend.take().is_err());
+        assert!(spend.take().is_err());
+        assert_eq!(spend.refused(), 2);
     }
 
     #[test]
