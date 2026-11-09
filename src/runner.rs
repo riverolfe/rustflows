@@ -74,7 +74,7 @@ fn binary() -> String {
     std::env::var("RUSTFLOWS_CLAUDE").unwrap_or_else(|_| "claude".to_string())
 }
 
-fn model() -> Option<String> {
+pub(crate) fn model() -> Option<String> {
     std::env::var("RUSTFLOWS_MODEL").ok().filter(|m| !m.is_empty())
 }
 

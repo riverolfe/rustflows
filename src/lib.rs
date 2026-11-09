@@ -120,6 +120,7 @@ pub fn cache_key(
         schema.clone(),
         Value::Array(tools_sorted.into_iter().map(Value::String).collect()),
         Value::String(system.to_string()),
+        Value::String(runner::model().unwrap_or_default()),
         Value::String(cwd.to_string()),
         Value::String(depends_on.to_string()),
     ];
@@ -471,6 +472,9 @@ fn blocked_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
+                // Shared Address Space (RFC 6598), including metadata endpoints
+                // such as Alibaba Cloud's 100.100.100.200.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
                 || v4.is_unspecified()
                 || v4.octets()[0] == 0
         }
